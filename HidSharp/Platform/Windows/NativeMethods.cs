@@ -77,6 +77,7 @@ namespace HidSharp.Platform.Windows
         public const uint WAIT_OBJECT_1 = 1;
         public const uint WAIT_TIMEOUT = 258;
         public const uint WM_DEVICECHANGE = 537;
+        public const int WM_QUIT = 0x0012;
 
         public const uint RTS_CONTROL_DISABLE = 0;
         public const uint RTS_CONTROL_ENABLE = 1;
@@ -1028,7 +1029,10 @@ namespace HidSharp.Platform.Windows
         [DllImport("kernel32.dll", CharSet = CharSet.Auto)]
         [return: MarshalAs(UnmanagedType.Bool)]
         public static extern bool GetVersionEx(ref OSVERSIONINFO version);
-         
+
+        [DllImport("user32.dll")]
+        public static extern int PostMessage(IntPtr hWnd, int wMsg, IntPtr wParam, IntPtr lParam);
+
         [DllImport("hid.dll")]
         public static extern void HidD_GetHidGuid(out Guid hidGuid);
 
