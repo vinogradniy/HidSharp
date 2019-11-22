@@ -21,14 +21,11 @@
 
 using System;
 using System.Collections.Generic;
-using System.Diagnostics;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
-using System.Security.AccessControl;
-using System.Text;
 using System.Threading;
-using HidSharp.Experimental;
+
 using HidSharp.Utility;
-using Microsoft.Win32;
 
 namespace HidSharp.Platform.Windows
 {
@@ -121,6 +118,8 @@ namespace HidSharp.Platform.Windows
         static object _serDeviceKeysCacheNotifyObject;
         static object _bleDeviceKeysCacheNotifyObject;
 
+        private volatile object initWinSyncObject = new object();
+
         public WinHidManager()
         {
             if (Environment.OSVersion.Platform == PlatformID.Win32NT)
@@ -152,20 +151,49 @@ namespace HidSharp.Platform.Windows
 #endif
         protected override void Run(Action readyCallback)
         {
-            const string className = "HidSharpDeviceMonitor";
+            var className = $"HidSharpDeviceMonitor{Guid.NewGuid():N}"; // unique class/window name allows to load library into some AppDomain 
 
             NativeMethods.WindowProc windowProc = DeviceMonitorWindowProc;
             var wc = new NativeMethods.WNDCLASS() { ClassName = className, WindowProc = windowProc };
-            RunAssert(0 != NativeMethods.RegisterClass(ref wc), "HidSharp RegisterClass failed.");
+            var hwnd = IntPtr.Zero;
+            var hidNotifyHandle = IntPtr.Zero;
+            var bleNotifyHandle = IntPtr.Zero;
+            var registerClass = false;
+            var appDomainFinalize = false;
+            var appFinalized = false;
 
-            var hwnd = NativeMethods.CreateWindowEx(0, className, className, 0,
-                                                    NativeMethods.CW_USEDEFAULT, NativeMethods.CW_USEDEFAULT, NativeMethods.CW_USEDEFAULT, NativeMethods.CW_USEDEFAULT,
-                                                    NativeMethods.HWND_MESSAGE,
-                                                    IntPtr.Zero, IntPtr.Zero, IntPtr.Zero);
-            RunAssert(hwnd != IntPtr.Zero, "HidSharp CreateWindow failed.");
+            lock (this.initWinSyncObject)
+            { 
+                registerClass = NativeMethods.RegisterClass(ref wc) != 0;
+                RunAssert(registerClass, "HidSharp RegisterClass failed.");
 
-            var hidNotifyHandle = RegisterDeviceNotification(hwnd, NativeMethods.HidD_GetHidGuid());
-            var bleNotifyHandle = RegisterDeviceNotification(hwnd, NativeMethods.GuidForBluetoothLEDevice);
+                hwnd = NativeMethods.CreateWindowEx(0, className, className, 0,
+                    NativeMethods.CW_USEDEFAULT, NativeMethods.CW_USEDEFAULT, NativeMethods.CW_USEDEFAULT, NativeMethods.CW_USEDEFAULT,
+                    NativeMethods.HWND_MESSAGE,
+                    IntPtr.Zero, IntPtr.Zero, IntPtr.Zero);
+                RunAssert(hwnd != IntPtr.Zero, "HidSharp CreateWindow failed.");
+            }
+
+            // close window when AppDomain unload
+            AppDomain.CurrentDomain.DomainUnload += (sender, args) =>
+                {
+                    // close HidSharp window if need
+                    appDomainFinalize = true;
+                    if (appFinalized) { return; }
+
+                    lock (this.initWinSyncObject)
+                    {
+                        if (hwnd != IntPtr.Zero)
+                        {
+                            NativeMethods.PostMessage(hwnd, NativeMethods.WM_QUIT, IntPtr.Zero, IntPtr.Zero);
+                            var result = NativeMethods.DestroyWindow(hwnd);
+                            HidSharpDiagnostics.Trace("HidSharp window destroyed: {0} result {1}", hwnd, result);
+                        }
+                    }
+                };
+
+            hidNotifyHandle = RegisterDeviceNotification(hwnd, NativeMethods.HidD_GetHidGuid());
+            bleNotifyHandle = RegisterDeviceNotification(hwnd, NativeMethods.GuidForBluetoothLEDevice);
 
 #if BLUETOOTH_NOTIFY
             var bleHandles = new List<BleRadio>(); // FIXME: We don't handle the removal of USB Bluetooth dongles here, as far as notifications go.
@@ -209,32 +237,46 @@ namespace HidSharp.Platform.Windows
 
             readyCallback();
 
-            NativeMethods.MSG msg;
-            while (true)
+            RuntimeHelpers.PrepareConstrainedRegions();
+            try
             {
-                int result = NativeMethods.GetMessage(out msg, hwnd, 0, 0);
-                if (result == 0 || result == -1) { break; }
+                NativeMethods.MSG msg;
+                while (!appDomainFinalize)
+                {
+                    int result = NativeMethods.GetMessage(out msg, hwnd, 0, 0);
+                    if (result == 0 || result == -1) { break; }
 
-                NativeMethods.TranslateMessage(ref msg);
-                NativeMethods.DispatchMessage(ref msg);
+                    NativeMethods.TranslateMessage(ref msg);
+                    NativeMethods.DispatchMessage(ref msg);
+                }
             }
+            finally
+            {
+                appFinalized = true;
 
-            //lock (_bleDiscoveryThread) { _bleDiscoveryShuttingDown = true; Monitor.Pulse(_bleDiscoveryThread); }
-            lock (_notifyThread) { _notifyThreadShuttingDown = true; Monitor.Pulse(_notifyThread); }
-            NativeMethods.SetEvent(_serialWatcherShutdownEvent);
-            //_bleDiscoveryThread.Join();
-            _notifyThread.Join();
-            _serialWatcherThread.Join();
-
-            UnregisterDeviceNotification(hidNotifyHandle);
-            UnregisterDeviceNotification(bleNotifyHandle);
+                if (hidNotifyHandle != IntPtr.Zero) { UnregisterDeviceNotification(hidNotifyHandle); }
+                if (bleNotifyHandle != IntPtr.Zero) { UnregisterDeviceNotification(bleNotifyHandle); }
 #if BLUETOOTH_NOTIFY
             foreach (var bleHandle in bleHandles) { UnregisterDeviceNotification(bleHandle.NotifyHandle); NativeMethods.CloseHandle(bleHandle.RadioHandle); }
 #endif
+                if (hwnd != IntPtr.Zero) { /*RunAssert(*/NativeMethods.DestroyWindow(hwnd)/*, "HidSharp DestroyWindow failed.")*/; }
+                if (registerClass) { /*RunAssert(*/NativeMethods.UnregisterClass(className, IntPtr.Zero)/*, "HidSharp UnregisterClass failed.")*/; }
 
-            RunAssert(NativeMethods.DestroyWindow(hwnd), "HidSharp DestroyWindow failed.");
-            RunAssert(NativeMethods.UnregisterClass(className, IntPtr.Zero), "HidSharp UnregisterClass failed.");
-            GC.KeepAlive(windowProc);
+                //lock (_bleDiscoveryThread) { _bleDiscoveryShuttingDown = true; Monitor.Pulse(_bleDiscoveryThread); }
+                lock (_notifyThread) { _notifyThreadShuttingDown = true; Monitor.Pulse(_notifyThread); }
+                NativeMethods.SetEvent(_serialWatcherShutdownEvent);
+            }
+
+            //_bleDiscoveryThread.Join();
+            if (!appDomainFinalize)
+            {
+                _notifyThread.Join();
+                _serialWatcherThread.Join();
+            }
+
+            NativeMethods.CloseHandle(_serialWatcherShutdownEvent);
+
+            GC.KeepAlive(windowProc);      
         }
 
         static IntPtr  RegisterDeviceNotification(IntPtr hwnd, Guid guid)
